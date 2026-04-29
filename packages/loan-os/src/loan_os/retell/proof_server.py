@@ -156,6 +156,29 @@ def _money(value: Any) -> str:
   return f"${amount}" if amount else ""
 
 
+def _detect_transaction_type(*values: Any) -> str:
+  text = " ".join(str(value or "").lower() for value in values)
+  if "cash-out" in text or "cash out" in text:
+    return "Cash-out refi"
+  if "refi" in text or "refinance" in text:
+    return "Refinance"
+  if "purchase" in text or "buy" in text or "acquir" in text:
+    return "Purchase"
+  if "bridge" in text:
+    return "Bridge / payoff"
+  if "fix" in text and "flip" in text:
+    return "Fix-and-flip"
+  return "DSCR inquiry"
+
+
+def _concise_overview(row: dict[str, Any], opening: str) -> str:
+  source = str(row.get("lead_overview") or row.get("reactivation_brief") or opening or "Recent DSCR lead with limited context available.").strip()
+  source = source.replace("\n", " ").replace("  ", " ")
+  if len(source) > 280:
+    source = source[:277].rsplit(" ", 1)[0] + "..."
+  return source
+
+
 def _read_csv_rows(path: Path) -> list[dict[str, str]]:
   if not path.exists():
     return []
@@ -201,6 +224,12 @@ def _build_recent_lo_scoreboard() -> dict[str, Any]:
     score = _as_int(row.get("score")) or round((_freshness_points(age_days) * 0.48) + (readiness * 0.23) + (profitability * 0.17) + transcript_points)
     first_name = str(row.get("first_name") or "there").strip()
     opening = str(row.get("opening_context_line") or "you had reached out about a DSCR loan").strip()
+    transaction_type = str(row.get("transaction_type") or "").strip() or _detect_transaction_type(
+      opening,
+      row.get("reactivation_brief"),
+      row.get("known_facts"),
+      row.get("recommended_first_question"),
+    )
     rows.append(
       {
         "rank": 0,
@@ -218,11 +247,9 @@ def _build_recent_lo_scoreboard() -> dict[str, Any]:
         "source_category": row.get("enrichment_source", ""),
         "prior_call_count": prior_call_count,
         "prior_connected_seconds": prior_connected_seconds,
+        "transaction_type": transaction_type,
+        "lead_overview": _concise_overview(row, opening),
         "opening_context_line": opening,
-        "suggested_opening_line": (
-          f"Hi {first_name}, this is Alex with Evolve Funding. "
-          f"I was just touching base on {opening}. Are you still looking into DSCR loan options or are you all set?"
-        ),
       }
     )
   rows.sort(key=lambda item: (item["score"], item["estimated_amount"], -item["age_days"]), reverse=True)
@@ -253,8 +280,8 @@ def _render_recent_lo_scoreboard(payload: dict[str, Any], token: str | None = No
   <div class="rank">#{row['rank']}</div>
   <div class="mainline"><strong>{html.escape(str(row['first_name']).title())}</strong><span>{html.escape(str(row['estimated_amount_label'] or 'Amount unknown'))}</span></div>
   <div class="meta">{row['age_days']} days old · Score {row['score']} · {html.escape(str(row['source_category']))}</div>
-  <p>{html.escape(str(row['suggested_opening_line']))}</p>
-  <div class="chips"><span>Recent lead</span><span>{html.escape(str(row['prior_call_count']))} prior calls</span><span>{html.escape(str(row['prior_connected_seconds']))} connected seconds</span></div>
+  <p>{html.escape(str(row['lead_overview']))}</p>
+  <div class="chips"><span>{html.escape(str(row['transaction_type']))}</span><span>{html.escape(str(row['prior_call_count']))} prior calls</span><span>{html.escape(str(row['prior_connected_seconds']))} connected seconds</span></div>
   <div class="links"><a href="tel:{html.escape(str(row['phone']))}">Call</a><a href="https://app.getmoremortgages.com/v2/location/HSCyuJDGKA5J5gfjfHzi/contacts/detail/{html.escape(str(row['contact_id']))}">GHL</a></div>
 </article>"""
     )

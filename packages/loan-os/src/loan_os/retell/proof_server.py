@@ -210,9 +210,11 @@ def _build_recent_lo_scoreboard() -> dict[str, Any]:
   rows: list[dict[str, Any]] = []
   for row in enriched:
     form_dt = _parse_dt(row.get("original_form_fill_at"))
-    if not form_dt:
-      continue
-    age_days = max(0, (generated_at.date() - form_dt.date()).days)
+    age_days = _as_int(row.get("age_days")) if row.get("age_days") not in {None, ""} else -1
+    if age_days < 0:
+      if not form_dt:
+        continue
+      age_days = max(0, (generated_at.date() - form_dt.date()).days)
     if age_days > 21:
       continue
     estimated = _as_int(row.get("estimated_largest_amount"))

@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: evolve-retell-loan-os
+    env: docker
+    plan: starter
+    dockerfilePath: ./packages/loan-os/Dockerfile
+    healthCheckPath: /health
+    disk:
+      name: evolve-retell-data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: EVOLVE_REPO_ROOT
+        value: /app
+      - key: EVOLVE_DATA_ROOT
+        value: /data
+      - key: RETELL_PROOF_HOST
+        value: 0.0.0.0
+      - key: RETELL_PROOF_PORT
+        value: 8080
+      - key: RETELL_DISABLE_SIDE_EFFECTS
+        value: "1"
+      - key: RETELL_PROOF_USE_LIVE_GHL_AVAILABILITY
+        value: "true"
+      - key: RETELL_PROOF_ALLOW_LIVE_GHL_BOOKING
+        value: "false"
+      - key: LOG_LEVEL
+        value: INFO

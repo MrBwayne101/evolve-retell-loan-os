@@ -1,0 +1,8 @@
+.env
+*.log
+__pycache__/
+*.pyc
+.DS_Store
+/data/voice-agent/retell/calls/
+/data/voice-agent/retell/events.jsonl
+/data/voice-agent/retell/ghl-notes*/

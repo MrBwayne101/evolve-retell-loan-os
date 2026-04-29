@@ -1,0 +1,667 @@
+from __future__ import annotations
+
+import argparse
+import csv
+import hmac
+import json
+import logging
+import os
+import re
+import time
+from pathlib import Path
+from typing import Any
+from urllib import error, request
+
+from aiohttp import web
+
+from loan_os.ghl_calendar import book_selected_slot as book_selected_calendar_slot
+from loan_os.ghl_calendar import get_availability
+
+
+LOGGER = logging.getLogger("loan_os.retell.proof_server")
+
+
+def _default_repo_root() -> Path:
+  return Path(os.getenv("EVOLVE_REPO_ROOT", "/Users/brucewayne/evolve-integration")).expanduser()
+
+
+def _default_data_root() -> Path:
+  return Path(os.getenv("EVOLVE_DATA_ROOT", str(_default_repo_root() / "data"))).expanduser()
+
+
+REPO_ROOT = _default_repo_root()
+DATA_ROOT = _default_data_root()
+EVENT_DIR = DATA_ROOT / "voice-agent" / "retell"
+EVENT_LOG = EVENT_DIR / "events.jsonl"
+CONFIG_PATH = EVENT_DIR / "proof-config.json"
+WEB_BUNDLE_PATH = REPO_ROOT / "data" / "voice-agent" / "retell-web" / "dist" / "client.bundle.js"
+CALL_CAPTURE_DIR = EVENT_DIR / "calls"
+GHL_NOTE_DIR = EVENT_DIR / "ghl-notes"
+GHL_NOTE_RETRY_DIR = EVENT_DIR / "ghl-notes-retry"
+REACTIVATION_DIR = DATA_ROOT / "voice-agent" / "reactivation-enrichment"
+
+
+def _now_ms() -> int:
+  return int(time.time() * 1000)
+
+
+def _append_event(kind: str, payload: dict[str, Any]) -> None:
+  EVENT_DIR.mkdir(parents=True, exist_ok=True)
+  record = {
+    "kind": kind,
+    "timestamp_ms": _now_ms(),
+    "payload": payload,
+  }
+  with EVENT_LOG.open("a", encoding="utf-8") as f:
+    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+  LOGGER.info("event", extra={"event_kind": kind})
+
+
+def _setup_logging() -> None:
+  level = os.getenv("LOG_LEVEL", "INFO").upper()
+  logging.basicConfig(
+    level=getattr(logging, level, logging.INFO),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+  )
+
+
+def _kill_switch_active() -> bool:
+  if os.getenv("RETELL_KILL_SWITCH", "").strip().lower() in {"1", "true", "yes", "on"}:
+    return True
+  kill_file = os.getenv("RETELL_KILL_FILE")
+  if kill_file and Path(kill_file).expanduser().exists():
+    return True
+  return (EVENT_DIR / "KILL_SWITCH").exists()
+
+
+def _side_effects_disabled() -> bool:
+  return os.getenv("RETELL_DISABLE_SIDE_EFFECTS", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _admin_authorized(request: web.Request) -> bool:
+  token = os.getenv("RETELL_ADMIN_TOKEN", "").strip()
+  if not token:
+    return False
+  supplied = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+  return hmac.compare_digest(supplied, token)
+
+
+@web.middleware
+async def operational_guard(request: web.Request, handler):  # noqa: ANN001
+  if request.path.startswith("/admin/"):
+    if not _admin_authorized(request):
+      return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+  if _kill_switch_active() and not request.path.startswith(("/health", "/ready", "/admin/")):
+    return web.json_response({"ok": False, "error": "kill_switch_active"}, status=503)
+  return await handler(request)
+
+
+def _extract_args(payload: dict[str, Any]) -> dict[str, Any]:
+  for key in ("args", "arguments", "parameters"):
+    value = payload.get(key)
+    if isinstance(value, dict):
+      return value
+  tool_call = payload.get("tool_call")
+  if isinstance(tool_call, dict):
+    for key in ("args", "arguments", "parameters"):
+      value = tool_call.get(key)
+      if isinstance(value, dict):
+        return value
+  return {}
+
+
+def _digits(value: str | None) -> str:
+  return re.sub(r"\D+", "", value or "")
+
+
+def _lookup_reactivation_lead(phone: str | None) -> dict[str, str]:
+  target = _digits(phone)
+  if not target:
+    return {}
+  if len(target) == 11 and target.startswith("1"):
+    target10 = target[1:]
+  else:
+    target10 = target[-10:]
+
+  candidate_paths = sorted(
+    REACTIVATION_DIR.glob("launch-batch-2026-04-28*.csv"),
+    key=lambda path: path.stat().st_mtime,
+    reverse=True,
+  )
+  for path in candidate_paths:
+    try:
+      with path.open(newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+          row_phone = _digits(row.get("phone"))
+          row10 = row_phone[1:] if len(row_phone) == 11 and row_phone.startswith("1") else row_phone[-10:]
+          if row10 and row10 == target10:
+            return {key: str(value or "") for key, value in row.items()}
+    except OSError:
+      continue
+  return {}
+
+
+async def health(_: web.Request) -> web.Response:
+  return web.json_response({"ok": True, "service": "loan-os-retell-proof"})
+
+
+async def ready(_: web.Request) -> web.Response:
+  checks: dict[str, Any] = {}
+  status = 200
+  try:
+    EVENT_DIR.mkdir(parents=True, exist_ok=True)
+    probe = EVENT_DIR / ".ready_probe"
+    probe.write_text(str(_now_ms()), encoding="utf-8")
+    checks["event_storage"] = {"ok": probe.exists(), "path": str(EVENT_DIR)}
+  except Exception as exc:
+    checks["event_storage"] = {"ok": False, "error": str(exc)}
+    status = 503
+
+  checks["reactivation_context"] = {
+    "ok": REACTIVATION_DIR.exists(),
+    "path": str(REACTIVATION_DIR),
+    "csv_count": len(list(REACTIVATION_DIR.glob("launch-batch-2026-04-28*.csv")))
+    if REACTIVATION_DIR.exists()
+    else 0,
+  }
+  if not checks["reactivation_context"]["ok"]:
+    status = 503
+
+  checks["ghl_configured"] = {"ok": _ghl_configured()}
+  checks["kill_switch"] = {"active": _kill_switch_active()}
+  checks["side_effects"] = {"disabled": _side_effects_disabled()}
+  return web.json_response({"ok": status == 200, "checks": checks}, status=status)
+
+
+async def admin_status(_: web.Request) -> web.Response:
+  return web.json_response(
+    {
+      "ok": True,
+      "kill_switch_active": _kill_switch_active(),
+      "side_effects_disabled": _side_effects_disabled(),
+      "event_dir": str(EVENT_DIR),
+      "event_log_exists": EVENT_LOG.exists(),
+      "captured_calls": len(list(CALL_CAPTURE_DIR.glob("call_*.json")))
+      if CALL_CAPTURE_DIR.exists()
+      else 0,
+      "ghl_note_markers": len(list(GHL_NOTE_DIR.glob("*.json"))) if GHL_NOTE_DIR.exists() else 0,
+      "ghl_note_retries": len(list(GHL_NOTE_RETRY_DIR.glob("*.json")))
+      if GHL_NOTE_RETRY_DIR.exists()
+      else 0,
+    }
+  )
+
+
+async def admin_kill(_: web.Request) -> web.Response:
+  EVENT_DIR.mkdir(parents=True, exist_ok=True)
+  (EVENT_DIR / "KILL_SWITCH").write_text(str(_now_ms()), encoding="utf-8")
+  _append_event("admin_kill_switch_enabled", {"source": "admin_endpoint"})
+  return web.json_response({"ok": True, "kill_switch_active": True})
+
+
+async def admin_resume(_: web.Request) -> web.Response:
+  kill_file = EVENT_DIR / "KILL_SWITCH"
+  if kill_file.exists():
+    kill_file.unlink()
+  _append_event("admin_kill_switch_disabled", {"source": "admin_endpoint"})
+  return web.json_response({"ok": True, "kill_switch_active": _kill_switch_active()})
+
+
+async def inbound_callback_webhook(request: web.Request) -> web.Response:
+  payload = await request.json()
+  inbound = payload.get("call_inbound") if isinstance(payload.get("call_inbound"), dict) else {}
+  from_number = str(inbound.get("from_number") or payload.get("from_number") or "")
+  lead = _lookup_reactivation_lead(from_number)
+  dynamic_variables = {
+    "first_name": lead.get("first_name", ""),
+    "ghl_contact_id": lead.get("contact_id", ""),
+    "opening_context_line": lead.get("opening_context_line", "your DSCR loan options"),
+    "pain_point_opener": lead.get("pain_point_opener", ""),
+    "reactivation_brief": lead.get("reactivation_brief", ""),
+    "recommended_first_question": lead.get("recommended_first_question", ""),
+    "callback_context_found": "true" if lead else "false",
+  }
+  response = {
+    "call_inbound": {
+      "dynamic_variables": dynamic_variables,
+      "metadata": {
+        "project": "evolve_voice_agent",
+        "purpose": "jr_reactivation_inbound_callback",
+        "from_number": from_number,
+        "ghl_contact_id": lead.get("contact_id", ""),
+        "context_found": bool(lead),
+      },
+    }
+  }
+  _append_event("retell_inbound_callback_webhook", {"payload": payload, "response": response})
+  return web.json_response(response)
+
+
+def _load_env() -> None:
+  env_path = REPO_ROOT / ".env"
+  if not env_path.exists():
+    return
+  for raw in env_path.read_text(encoding="utf-8").splitlines():
+    line = raw.strip()
+    if not line or line.startswith("#") or "=" not in line:
+      continue
+    key, value = line.split("=", 1)
+    os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+def _retell_create_web_call(agent_id: str) -> dict[str, Any]:
+  key = os.environ.get("RETELL_API_KEY")
+  if not key:
+    raise RuntimeError("RETELL_API_KEY is not set")
+  body = {
+    "agent_id": agent_id,
+    "metadata": {
+      "project": "evolve_voice_agent",
+      "purpose": "Dave controlled Retell web proof",
+    },
+    "retell_llm_dynamic_variables": {
+      "test_name": "managed_voice_bakeoff_retell_web_proof",
+    },
+  }
+  req = request.Request(
+    "https://api.retellai.com/v2/create-web-call",
+    data=json.dumps(body).encode("utf-8"),
+    method="POST",
+    headers={
+      "Authorization": f"Bearer {key}",
+      "Content-Type": "application/json",
+    },
+  )
+  try:
+    with request.urlopen(req, timeout=30) as resp:
+      return json.loads(resp.read().decode("utf-8"))
+  except error.HTTPError as exc:
+    detail = exc.read().decode("utf-8", errors="replace")
+    raise RuntimeError(f"Retell create-web-call failed: {exc.code} {detail}") from exc
+
+
+async def web_call_page(_: web.Request) -> web.Response:
+  html = """<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Evolve Retell Proof</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 32px; color: #111827; }
+    button { font-size: 18px; padding: 14px 18px; margin-right: 8px; border: 0; border-radius: 8px; background: #111827; color: white; }
+    button:disabled { opacity: 0.5; }
+    button.secondary { background: #6b7280; }
+    #status { margin: 16px 0; font-weight: 700; }
+    #log { margin-top: 20px; white-space: pre-wrap; background: #f3f4f6; padding: 16px; border-radius: 8px; min-height: 220px; max-height: 55vh; overflow: auto; }
+  </style>
+</head>
+<body>
+  <h1>Evolve Retell Proof</h1>
+  <p>Use this for Dave-controlled latency and quality testing. It does not dial prospects.</p>
+  <button id="start">Start Web Call</button>
+  <button id="stop" class="secondary">Stop</button>
+  <div id="status">Idle</div>
+  <div id="log"></div>
+  <script src="/retell/client.bundle.js"></script>
+</body>
+</html>
+"""
+  return web.Response(text=html, content_type="text/html")
+
+
+async def web_client_bundle(_: web.Request) -> web.Response:
+  if not WEB_BUNDLE_PATH.exists():
+    return web.Response(text="Retell web bundle missing.", status=500)
+  return web.Response(
+    body=WEB_BUNDLE_PATH.read_bytes(),
+    content_type="application/javascript",
+  )
+
+
+async def create_web_call(_: web.Request) -> web.Response:
+  _load_env()
+  try:
+    config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    agent_id = config["agent_id"]
+    payload = _retell_create_web_call(agent_id)
+  except Exception as exc:
+    return web.json_response({"ok": False, "error": str(exc)}, status=500)
+  _append_event("retell_create_web_call", payload)
+  return web.json_response(payload)
+
+
+async def retell_webhook(request: web.Request) -> web.Response:
+  _load_env()
+  try:
+    payload = await request.json()
+  except Exception:
+    payload = {"raw": await request.text()}
+  _append_event("retell_webhook", payload)
+  _capture_call_payload(payload)
+  _sync_call_note_to_ghl(payload)
+  return web.json_response({"ok": True})
+
+
+def _capture_call_payload(payload: dict[str, Any]) -> None:
+  call = payload.get("call")
+  if not isinstance(call, dict):
+    return
+  call_id = call.get("call_id")
+  if not isinstance(call_id, str) or not call_id:
+    return
+  event = str(payload.get("event") or "")
+  if event not in {"call_ended", "call_analyzed"}:
+    return
+  CALL_CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
+  raw_path = CALL_CAPTURE_DIR / f"{call_id}.{event}.json"
+  raw_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+  summary_path = CALL_CAPTURE_DIR / f"{call_id}.summary.json"
+  summary = {
+    "call_id": call_id,
+    "event": event,
+    "agent_id": call.get("agent_id"),
+    "agent_version": call.get("agent_version"),
+    "call_status": call.get("call_status"),
+    "direction": call.get("direction"),
+    "from_number": call.get("from_number"),
+    "to_number": call.get("to_number"),
+    "start_timestamp": call.get("start_timestamp"),
+    "end_timestamp": call.get("end_timestamp"),
+    "duration_ms": call.get("duration_ms"),
+    "disconnection_reason": call.get("disconnection_reason"),
+    "latency": call.get("latency") or {},
+    "tool_calls": call.get("tool_calls") or [],
+    "call_analysis": call.get("call_analysis") or {},
+    "recording_url": call.get("recording_url"),
+    "recording_multi_channel_url": call.get("recording_multi_channel_url"),
+    "public_log_url": call.get("public_log_url"),
+    "transcript": call.get("transcript") or "",
+  }
+  summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def _ghl_configured() -> bool:
+  return bool(
+    (os.getenv("GHL_PRIVATE_INTEGRATION_TOKEN") or os.getenv("GHL_API_KEY") or "").strip()
+    and (os.getenv("GHL_SUB_ACCOUNT_ID") or os.getenv("GHL_LOCATION_ID") or "").strip()
+  )
+
+
+def _ghl_headers(*, json_body: bool = False) -> dict[str, str]:
+  headers = {
+    "Accept": "application/json",
+    "Authorization": f"Bearer {(os.getenv('GHL_PRIVATE_INTEGRATION_TOKEN') or os.getenv('GHL_API_KEY') or '').strip()}",
+    "Version": (os.getenv("GHL_API_VERSION") or "2021-07-28").strip(),
+    "User-Agent": "EvolveFundingLoanOS/1.0",
+  }
+  if json_body:
+    headers["Content-Type"] = "application/json"
+  return headers
+
+
+def _ghl_post(path: str, body: dict[str, Any]) -> dict[str, Any]:
+  req = request.Request(
+    f"{(os.getenv('GHL_API_BASE') or 'https://services.leadconnectorhq.com').rstrip('/')}{path}",
+    data=json.dumps(body).encode("utf-8"),
+    method="POST",
+    headers=_ghl_headers(json_body=True),
+  )
+  try:
+    with request.urlopen(req, timeout=20) as resp:
+      raw = resp.read().decode("utf-8")
+      return json.loads(raw) if raw else {"ok": True}
+  except error.HTTPError as exc:
+    detail = exc.read().decode("utf-8", errors="replace")[:1200]
+    raise RuntimeError(f"GHL POST {path} failed: HTTP {exc.code}: {detail}") from exc
+
+
+def _ghl_get(path: str, params: dict[str, str]) -> dict[str, Any]:
+  from urllib.parse import urlencode
+
+  qs = urlencode({key: value for key, value in params.items() if value})
+  req = request.Request(
+    f"{(os.getenv('GHL_API_BASE') or 'https://services.leadconnectorhq.com').rstrip('/')}{path}?{qs}",
+    method="GET",
+    headers=_ghl_headers(),
+  )
+  try:
+    with request.urlopen(req, timeout=20) as resp:
+      raw = resp.read().decode("utf-8")
+      return json.loads(raw) if raw else {"ok": True}
+  except error.HTTPError as exc:
+    detail = exc.read().decode("utf-8", errors="replace")[:1200]
+    raise RuntimeError(f"GHL GET {path} failed: HTTP {exc.code}: {detail}") from exc
+
+
+def _extract_contact_id(payload: Any) -> str | None:
+  if isinstance(payload, dict):
+    for key in ("contactId", "contact_id", "id", "_id"):
+      value = payload.get(key)
+      if isinstance(value, str) and value.strip():
+        return value.strip()
+    for key in ("contact", "data"):
+      found = _extract_contact_id(payload.get(key))
+      if found:
+        return found
+  if isinstance(payload, list):
+    for item in payload:
+      found = _extract_contact_id(item)
+      if found:
+        return found
+  return None
+
+
+def _resolve_ghl_contact_id(call: dict[str, Any]) -> str | None:
+  for container_key in ("retell_llm_dynamic_variables", "metadata"):
+    values = call.get(container_key)
+    if isinstance(values, dict):
+      for key in ("ghl_contact_id", "contact_id", "ghlContactId"):
+        value = values.get(key)
+        if isinstance(value, str) and value.strip():
+          return value.strip()
+  direction = str(call.get("direction") or "")
+  phone = str(call.get("to_number") if direction == "outbound" else call.get("from_number") or "").strip()
+  if not phone:
+    return None
+  try:
+    duplicate = _ghl_get("/contacts/search/duplicate", {"phone": phone})
+    return _extract_contact_id(duplicate)
+  except Exception as exc:
+    _append_event("retell_ghl_contact_lookup_failed", {"call_id": call.get("call_id"), "phone": phone, "error": str(exc)})
+    return None
+
+
+def _short_transcript_excerpt(transcript: str) -> str:
+  lines = [line.strip() for line in transcript.splitlines() if line.strip()]
+  return "\n".join(lines[-8:])[:1200]
+
+
+def _build_ghl_call_note(call: dict[str, Any]) -> str:
+  analysis = call.get("call_analysis") if isinstance(call.get("call_analysis"), dict) else {}
+  tool_calls = call.get("tool_calls") if isinstance(call.get("tool_calls"), list) else []
+  transfer_status = "none"
+  if any(tool.get("type") == "transfer_call" and tool.get("success") for tool in tool_calls if isinstance(tool, dict)):
+    transfer_status = "attempted / Retell tool success"
+  if str(call.get("disconnection_reason") or "") == "call_transfer":
+    transfer_status = "transferred out of Retell"
+  booking_status = "none"
+  if any(tool.get("name") == "book_selected_slot" and tool.get("success") for tool in tool_calls if isinstance(tool, dict)):
+    booking_status = "booked / Retell tool success"
+  elif any(tool.get("name") == "book_selected_slot" for tool in tool_calls if isinstance(tool, dict)):
+    booking_status = "attempted / needs review"
+  transcript = str(call.get("transcript") or "")
+  summary = str(analysis.get("call_summary") or "Retell Alex Jr Reactivation call completed.").strip()
+  return (
+    "Alex Jr Reactivation AI Call\n"
+    f"Call ID: {call.get('call_id')}\n"
+    f"Outcome: {call.get('disconnection_reason') or call.get('call_status')}\n"
+    f"Transfer: {transfer_status}\n"
+    f"Booking: {booking_status}\n"
+    f"Duration: {round((int(call.get('duration_ms') or 0) / 1000), 1)} seconds\n"
+    f"Summary: {summary}\n"
+    f"Recording: {call.get('recording_url') or 'not available'}\n"
+    f"Public log: {call.get('public_log_url') or 'not available'}\n\n"
+    "Transcript tail:\n"
+    f"{_short_transcript_excerpt(transcript)}"
+  )[:5000]
+
+
+def _sync_call_note_to_ghl(payload: dict[str, Any]) -> None:
+  if payload.get("event") != "call_analyzed":
+    return
+  call = payload.get("call")
+  if not isinstance(call, dict):
+    return
+  call_id = call.get("call_id")
+  if not isinstance(call_id, str) or not call_id:
+    return
+  GHL_NOTE_DIR.mkdir(parents=True, exist_ok=True)
+  marker = GHL_NOTE_DIR / f"{call_id}.json"
+  if marker.exists():
+    return
+  if _side_effects_disabled():
+    marker.write_text(
+      json.dumps({"ok": False, "skipped": "side_effects_disabled", "call_id": call_id}, indent=2),
+      encoding="utf-8",
+    )
+    return
+  if not _ghl_configured():
+    marker.write_text(json.dumps({"ok": False, "skipped": "ghl_not_configured", "call_id": call_id}, indent=2), encoding="utf-8")
+    return
+  contact_id = _resolve_ghl_contact_id(call)
+  if not contact_id:
+    marker.write_text(json.dumps({"ok": False, "skipped": "contact_not_found", "call_id": call_id}, indent=2), encoding="utf-8")
+    return
+  note = _build_ghl_call_note(call)
+  try:
+    result = _ghl_post(
+      f"/contacts/{contact_id}/notes",
+      {"body": note},
+    )
+    marker.write_text(
+      json.dumps({"ok": True, "call_id": call_id, "contact_id": contact_id, "result": result}, indent=2, ensure_ascii=False),
+      encoding="utf-8",
+    )
+    _append_event("retell_ghl_note_created", {"call_id": call_id, "contact_id": contact_id})
+  except Exception as exc:
+    GHL_NOTE_RETRY_DIR.mkdir(parents=True, exist_ok=True)
+    retry_path = GHL_NOTE_RETRY_DIR / f"{call_id}.json"
+    retry_path.write_text(
+      json.dumps(
+        {"call_id": call_id, "contact_id": contact_id, "note": note, "error": str(exc)},
+        indent=2,
+        ensure_ascii=False,
+      ),
+      encoding="utf-8",
+    )
+    marker.write_text(
+      json.dumps({"ok": False, "call_id": call_id, "contact_id": contact_id, "error": str(exc)}, indent=2, ensure_ascii=False),
+      encoding="utf-8",
+    )
+    _append_event("retell_ghl_note_failed", {"call_id": call_id, "contact_id": contact_id, "error": str(exc)})
+
+
+async def book_or_transfer(request: web.Request) -> web.Response:
+  _load_env()
+  payload = await request.json()
+  args = _extract_args(payload)
+  _append_event("retell_tool_book_or_transfer", {"payload": payload, "args": args})
+
+  consent = bool(args.get("caller_confirmed_transfer_or_booking") or args.get("consent"))
+  if not consent:
+    return web.json_response(
+      {
+        "ok": False,
+        "message": "Consent was not explicit. Ask the caller if they want a loan officer to take a closer look before booking or transfer.",
+      }
+    )
+
+  availability = await get_availability(
+    timezone_name=str(args.get("timezone") or "America/Los_Angeles"),
+    limit=3,
+  )
+  slots = availability.get("slots", [])
+  if not availability.get("ok") or not slots:
+    return web.json_response(
+      {
+        "ok": True,
+        "live_transfer_available": False,
+        "booked": False,
+        "needs_slot_selection": False,
+        "availability": availability,
+        "message": "Looks like I couldn't get someone live, and I am not seeing a clean calendar opening. Tell the caller a loan officer will follow up, then log the note.",
+      }
+    )
+
+  displays = [str(slot.get("display")) for slot in slots[:3]]
+  if len(displays) == 1:
+    slot_message = displays[0]
+  elif len(displays) == 2:
+    slot_message = f"{displays[0]} or {displays[1]}"
+  else:
+    slot_message = f"{displays[0]}, {displays[1]}, or {displays[2]}"
+
+  result = {
+    "ok": True,
+    "live_transfer_available": False,
+    "booked": False,
+    "needs_slot_selection": True,
+    "calendar_id": availability.get("calendar_id"),
+    "availability_mode": availability.get("mode"),
+    "available_slots": slots[:3],
+    "message": f"Looks like I couldn't get someone live. Let me pull up availability and get an appointment booked for you. I have {slot_message}. Which of those works best?",
+  }
+  _append_event("retell_tool_availability_returned", result)
+  return web.json_response(result)
+
+
+async def book_selected_slot(request: web.Request) -> web.Response:
+  _load_env()
+  payload = await request.json()
+  args = _extract_args(payload)
+  _append_event("retell_tool_book_selected_slot", {"payload": payload, "args": args})
+  result = await book_selected_calendar_slot(args)
+  _append_event("retell_tool_book_selected_slot_result", result)
+  return web.json_response(result)
+
+
+async def log_call_note(request: web.Request) -> web.Response:
+  payload = await request.json()
+  args = _extract_args(payload)
+  _append_event("retell_tool_log_call_note", {"payload": payload, "args": args})
+  return web.json_response({"ok": True, "message": "Call note logged for controlled proof."})
+
+
+def build_app() -> web.Application:
+  _load_env()
+  _setup_logging()
+  app = web.Application(middlewares=[operational_guard])
+  app.router.add_get("/health", health)
+  app.router.add_get("/ready", ready)
+  app.router.add_get("/admin/status", admin_status)
+  app.router.add_post("/admin/kill", admin_kill)
+  app.router.add_post("/admin/resume", admin_resume)
+  app.router.add_get("/retell/web-call", web_call_page)
+  app.router.add_get("/retell/client.bundle.js", web_client_bundle)
+  app.router.add_post("/retell/create-web-call", create_web_call)
+  app.router.add_post("/retell/webhook", retell_webhook)
+  app.router.add_post("/retell/inbound-callback-webhook", inbound_callback_webhook)
+  app.router.add_post("/retell/tools/book_or_transfer", book_or_transfer)
+  app.router.add_post("/retell/tools/book_selected_slot", book_selected_slot)
+  app.router.add_post("/retell/tools/log_call_note", log_call_note)
+  return app
+
+
+def main() -> None:
+  parser = argparse.ArgumentParser(description="Run the Loan OS Retell proof webhook server.")
+  parser.add_argument("--host", default=os.getenv("RETELL_PROOF_HOST", "127.0.0.1"))
+  parser.add_argument("--port", type=int, default=int(os.getenv("RETELL_PROOF_PORT", "8080")))
+  args = parser.parse_args()
+
+  EVENT_DIR.mkdir(parents=True, exist_ok=True)
+  web.run_app(build_app(), host=args.host, port=args.port)
+
+
+if __name__ == "__main__":
+  main()

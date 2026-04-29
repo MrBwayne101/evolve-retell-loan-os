@@ -295,7 +295,8 @@ def _render_recent_lo_scoreboard(payload: dict[str, Any], token: str | None = No
       f"""<article class="lead" data-owner="{html.escape(str(row.get('owner') or 'Unassigned LO Review'))}" data-score="{row['score']}" data-amount="{row['estimated_amount']}" data-age="{row['age_days']}" data-lastcall="{html.escape(str(row.get('days_since_last_call') or '-1'))}">
   <div class="rank">#{row['rank']}</div>
   <div class="mainline"><strong>{html.escape(str(row['first_name']).title())}</strong><span>{html.escape(str(row['estimated_amount_label'] or 'Amount unknown'))}</span></div>
-  <div class="meta">{row['age_days']} days old · Last call: {html.escape(str(row.get('days_since_last_call') or 'unknown'))} days ago · Score {row['score']} · {html.escape(str(row['source_category']))}</div>
+  <div class="meta">{row['age_days']} days old · <span class="last-call" data-days="{html.escape(str(row.get('days_since_last_call') or '-1'))}">Last call: {html.escape(str(row.get('days_since_last_call') or 'unknown'))} days ago</span> · {html.escape(str(row['source_category']))}</div>
+  <div class="score">Score {row['score']}</div>
   <p>{html.escape(str(row['lead_overview']))}</p>
   <div class="chips"><span>{html.escape(str(row['transaction_type']))}</span><span>{html.escape(str(row['prior_call_count']))} prior calls</span><span>{html.escape(str(row['prior_connected_seconds']))} connected seconds</span></div>
   <div class="links"><a href="tel:{html.escape(str(row['phone']))}">Call</a><a href="https://app.getmoremortgages.com/v2/location/HSCyuJDGKA5J5gfjfHzi/contacts/detail/{html.escape(str(row['contact_id']))}">GHL</a></div>
@@ -315,8 +316,9 @@ def _render_recent_lo_scoreboard(payload: dict[str, Any], token: str | None = No
 h1{{font-size:32px;line-height:1.05;margin:0 0 8px}}p{{line-height:1.42}}.muted,.meta{{color:var(--muted)}}.stats{{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:18px 0}}
 .stat,.lead{{background:var(--card);border:1px solid var(--line);border-radius:8px}}.stat{{padding:15px}}.stat strong{{display:block;font-size:28px}}.stat span{{color:var(--muted)}}
 .toolbar{{display:flex;gap:8px;flex-wrap:wrap;margin:18px 0}}button,select{{border:1px solid var(--line);background:#fff;border-radius:999px;padding:9px 12px;font-weight:700}}button.active{{background:var(--accent);color:#fff;border-color:var(--accent)}}button span{{opacity:.75}}
-.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:12px}}.lead{{padding:14px;position:relative;min-height:220px}}.rank{{position:absolute;right:14px;top:14px;color:var(--accent);font-weight:800}}
+.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:12px}}.lead{{padding:14px;position:relative;min-height:240px}}.rank{{position:absolute;right:14px;top:14px;color:var(--accent);font-weight:800}}
 .mainline{{display:flex;gap:10px;align-items:baseline;padding-right:52px}}.mainline strong{{font-size:20px}}.mainline span{{color:var(--gold);font-weight:800}}.lead p{{margin:13px 0;color:#344054}}
+.score{{display:inline-flex;margin-top:10px;background:#dcfce7;color:#166534;border:1px solid #86efac;border-radius:999px;padding:7px 11px;font-size:18px;font-weight:900}}.last-call{{border-radius:999px;padding:3px 7px;font-weight:800}}.last-green{{background:#dcfce7;color:#166534}}.last-yellow{{background:#fef9c3;color:#854d0e}}.last-orange{{background:#ffedd5;color:#9a3412}}.last-red{{background:#fee2e2;color:#991b1b}}.last-gray{{background:#f2f4f7;color:#475467}}
 .chips{{display:flex;gap:6px;flex-wrap:wrap}}.chips span{{font-size:12px;background:#eef4f3;color:#134e48;border-radius:999px;padding:6px 8px}}.links{{display:flex;gap:10px;margin-top:14px}}.links a,.refresh{{color:var(--accent);font-weight:800;text-decoration:none}}
 @media(max-width:760px){{.hero{{display:block}}.stats{{grid-template-columns:1fr 1fr}}.shell{{padding:16px}}}}
 </style></head><body><div class="shell">
@@ -335,6 +337,14 @@ const buttons=[...document.querySelectorAll('button[data-owner]')];
 const cards=[...document.querySelectorAll('.lead')];
 const grid=document.querySelector('.grid');
 let activeOwner='all';
+document.querySelectorAll('.last-call').forEach(el=>{{
+  const days=Number(el.dataset.days);
+  if(days>=0 && days<=1) el.classList.add('last-green');
+  else if(days===2) el.classList.add('last-yellow');
+  else if(days===3) el.classList.add('last-orange');
+  else if(days>=4) el.classList.add('last-red');
+  else el.classList.add('last-gray');
+}});
 function sortCards(){{
   const mode=document.querySelector('#sort').value;
   cards.sort((a,b)=>{{

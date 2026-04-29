@@ -26,4 +26,4 @@ RUN mkdir -p /data/voice-agent/retell /data/voice-agent/reactivation-enrichment 
 EXPOSE 8080
 
 ENTRYPOINT ["/app/packages/loan-os/render-entrypoint.sh"]
-CMD ["gunicorn", "loan_os.retell.proof_server:build_app", "--bind", "0.0.0.0:8080", "--worker-class", "aiohttp.GunicornWebWorker", "--workers", "1", "--timeout", "90", "--access-logfile", "-", "--error-logfile", "-"]
+CMD ["gunicorn", "loan_os.retell.render_app:app", "--bind", "0.0.0.0:8080", "--worker-class", "aiohttp.GunicornWebWorker", "--workers", "1", "--timeout", "90", "--access-logfile", "-", "--error-logfile", "-"]

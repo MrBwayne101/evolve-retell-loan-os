@@ -505,7 +505,7 @@ async def speed_to_lead_shadow_intake(request: web.Request) -> web.Response:
 
   config = {
     "phone_number": os.getenv("RETELL_SPEED_TO_LEAD_FROM_NUMBER", os.getenv("RETELL_PHONE_NUMBER", "+19495691592")),
-    "agent_id": os.getenv("RETELL_SPEED_TO_LEAD_AGENT_ID", "agent_bafe1e2eede30a82315734615f"),
+    "agent_id": os.getenv("RETELL_SPEED_TO_LEAD_AGENT_ID", ""),
   }
   source_system = str(request.query.get("source_system") or payload.get("event_source") or "custom_website_api")
   result = prepare_speed_to_lead_shadow(payload, config, source_system=source_system)

@@ -249,6 +249,7 @@ def _build_recent_lo_scoreboard() -> dict[str, Any]:
         "source_category": row.get("enrichment_source", ""),
         "prior_call_count": prior_call_count,
         "prior_connected_seconds": prior_connected_seconds,
+        "days_since_last_call": row.get("days_since_last_call", ""),
         "transaction_type": transaction_type,
         "lead_overview": _concise_overview(row, opening),
         "opening_context_line": opening,
@@ -281,7 +282,7 @@ def _render_recent_lo_scoreboard(payload: dict[str, Any], token: str | None = No
       f"""<article class="lead">
   <div class="rank">#{row['rank']}</div>
   <div class="mainline"><strong>{html.escape(str(row['first_name']).title())}</strong><span>{html.escape(str(row['estimated_amount_label'] or 'Amount unknown'))}</span></div>
-  <div class="meta">{row['age_days']} days old · Score {row['score']} · {html.escape(str(row['source_category']))}</div>
+  <div class="meta">{row['age_days']} days old · Last call: {html.escape(str(row.get('days_since_last_call') or 'unknown'))} days ago · Score {row['score']} · {html.escape(str(row['source_category']))}</div>
   <p>{html.escape(str(row['lead_overview']))}</p>
   <div class="chips"><span>{html.escape(str(row['transaction_type']))}</span><span>{html.escape(str(row['prior_call_count']))} prior calls</span><span>{html.escape(str(row['prior_connected_seconds']))} connected seconds</span></div>
   <div class="links"><a href="tel:{html.escape(str(row['phone']))}">Call</a><a href="https://app.getmoremortgages.com/v2/location/HSCyuJDGKA5J5gfjfHzi/contacts/detail/{html.escape(str(row['contact_id']))}">GHL</a></div>

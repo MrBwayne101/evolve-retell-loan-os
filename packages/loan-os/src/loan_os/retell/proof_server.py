@@ -43,6 +43,7 @@ GHL_NOTE_RETRY_DIR = EVENT_DIR / "ghl-notes-retry"
 REACTIVATION_DIR = DATA_ROOT / "voice-agent" / "reactivation-enrichment"
 SCOREBOARD_DIR = DATA_ROOT / "loan-os" / "scoreboards"
 RECENT_LO_SCOREBOARD_SOURCE = SCOREBOARD_DIR / "recent-lo-source.csv"
+SCOREBOARD_ACCESS_TOKEN_FILE = SCOREBOARD_DIR / "access-token"
 
 
 def _now_ms() -> int:
@@ -91,7 +92,11 @@ def _admin_authorized(request: web.Request) -> bool:
 
 
 def _scoreboard_authorized(request: web.Request) -> bool:
-  token = os.getenv("SCOREBOARD_ACCESS_TOKEN", "").strip() or os.getenv("RETELL_ADMIN_TOKEN", "").strip()
+  token = os.getenv("SCOREBOARD_ACCESS_TOKEN", "").strip()
+  if not token and SCOREBOARD_ACCESS_TOKEN_FILE.exists():
+    token = SCOREBOARD_ACCESS_TOKEN_FILE.read_text(encoding="utf-8", errors="ignore").strip()
+  if not token:
+    token = os.getenv("RETELL_ADMIN_TOKEN", "").strip()
   if not token:
     return False
   supplied = (
@@ -357,6 +362,17 @@ async def admin_recent_lo_scoreboard_import(request: web.Request) -> web.Respons
     {"row_count": len(rows), "source_path": str(RECENT_LO_SCOREBOARD_SOURCE)},
   )
   return web.json_response({"ok": True, "imported_rows": len(rows), "published_rows": payload["summary"]["row_count"]})
+
+
+async def admin_set_scoreboard_access_token(request: web.Request) -> web.Response:
+  payload = await request.json()
+  token = str(payload.get("token") or "").strip()
+  if len(token) < 24:
+    return web.json_response({"ok": False, "error": "token_too_short"}, status=400)
+  SCOREBOARD_DIR.mkdir(parents=True, exist_ok=True)
+  SCOREBOARD_ACCESS_TOKEN_FILE.write_text(token, encoding="utf-8")
+  _append_event("scoreboard_access_token_updated", {"token_length": len(token)})
+  return web.json_response({"ok": True, "token_length": len(token)})
 
 
 def _lookup_reactivation_lead(phone: str | None) -> dict[str, str]:
@@ -888,6 +904,7 @@ def build_app() -> web.Application:
   app.router.add_get("/scoreboards/recent-lo.json", recent_lo_scoreboard_json)
   app.router.add_get("/admin/status", admin_status)
   app.router.add_post("/admin/scoreboards/recent-lo/import", admin_recent_lo_scoreboard_import)
+  app.router.add_post("/admin/scoreboards/access-token", admin_set_scoreboard_access_token)
   app.router.add_post("/admin/kill", admin_kill)
   app.router.add_post("/admin/resume", admin_resume)
   app.router.add_get("/retell/web-call", web_call_page)

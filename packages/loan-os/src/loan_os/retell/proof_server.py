@@ -16,7 +16,6 @@ from urllib import error, request
 
 from aiohttp import web
 
-from loan_os.call_center.speed_to_lead import prepare_speed_to_lead_shadow, redact_retell_request
 from loan_os.ghl_calendar import book_selected_slot as book_selected_calendar_slot
 from loan_os.ghl_calendar import get_availability
 
@@ -45,9 +44,6 @@ REACTIVATION_DIR = DATA_ROOT / "voice-agent" / "reactivation-enrichment"
 SCOREBOARD_DIR = DATA_ROOT / "loan-os" / "scoreboards"
 RECENT_LO_SCOREBOARD_SOURCE = SCOREBOARD_DIR / "recent-lo-source.csv"
 SCOREBOARD_ACCESS_TOKEN_FILE = SCOREBOARD_DIR / "access-token"
-SPEED_TO_LEAD_DIR = DATA_ROOT / "loan-os" / "speed-to-lead"
-SPEED_TO_LEAD_QUEUE = SPEED_TO_LEAD_DIR / "shadow-queue.jsonl"
-SPEED_TO_LEAD_AUDIT = SPEED_TO_LEAD_DIR / "shadow-audit.jsonl"
 
 
 def _now_ms() -> int:
@@ -64,12 +60,6 @@ def _append_event(kind: str, payload: dict[str, Any]) -> None:
   with EVENT_LOG.open("a", encoding="utf-8") as f:
     f.write(json.dumps(record, ensure_ascii=False) + "\n")
   LOGGER.info("event", extra={"event_kind": kind})
-
-
-def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
-  path.parent.mkdir(parents=True, exist_ok=True)
-  with path.open("a", encoding="utf-8") as f:
-    f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
 def _setup_logging() -> None:
@@ -487,43 +477,7 @@ async def ready(_: web.Request) -> web.Response:
   checks["ghl_configured"] = {"ok": _ghl_configured()}
   checks["kill_switch"] = {"active": _kill_switch_active()}
   checks["side_effects"] = {"disabled": _side_effects_disabled()}
-  checks["speed_to_lead_shadow"] = {
-    "ok": True,
-    "queue_path": str(SPEED_TO_LEAD_QUEUE),
-    "audit_path": str(SPEED_TO_LEAD_AUDIT),
-    "live_calls_enabled": False,
-  }
   return web.json_response({"ok": status == 200, "checks": checks}, status=status)
-
-
-async def speed_to_lead_shadow_intake(request: web.Request) -> web.Response:
-  _load_env()
-  try:
-    payload = await request.json()
-  except Exception:
-    return web.json_response({"ok": False, "error": "invalid_json"}, status=400)
-
-  config = {
-    "phone_number": os.getenv("RETELL_SPEED_TO_LEAD_FROM_NUMBER", os.getenv("RETELL_PHONE_NUMBER", "+19495691592")),
-    "agent_id": os.getenv("RETELL_SPEED_TO_LEAD_AGENT_ID", ""),
-  }
-  source_system = str(request.query.get("source_system") or payload.get("event_source") or "custom_website_api")
-  result = prepare_speed_to_lead_shadow(payload, config, source_system=source_system)
-  _append_jsonl(SPEED_TO_LEAD_QUEUE, result.shadow_queue_row)
-  _append_jsonl(SPEED_TO_LEAD_AUDIT, result.audit_event.to_record())
-  response = {
-    "ok": True,
-    "live_call_launched": False,
-    "ghl_write_attempted": False,
-    "los_write_attempted": False,
-    "borrower_message_sent": False,
-    "compliance": result.compliance.to_record(),
-    "queue_row": result.shadow_queue_row,
-    "call_context": result.call_context,
-    "retell_request_redacted": redact_retell_request(result.retell_request),
-  }
-  _append_event("speed_to_lead_shadow_intake", response)
-  return web.json_response(response)
 
 
 async def admin_status(_: web.Request) -> web.Response:
@@ -992,7 +946,6 @@ def build_app() -> web.Application:
   app = web.Application(middlewares=[operational_guard])
   app.router.add_get("/health", health)
   app.router.add_get("/ready", ready)
-  app.router.add_post("/speed-to-lead/shadow-intake", speed_to_lead_shadow_intake)
   app.router.add_get("/scoreboards/recent-lo", recent_lo_scoreboard)
   app.router.add_get("/scoreboards/recent-lo.json", recent_lo_scoreboard_json)
   app.router.add_get("/admin/status", admin_status)

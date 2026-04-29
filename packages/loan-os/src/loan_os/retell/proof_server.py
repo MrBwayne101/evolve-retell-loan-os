@@ -222,7 +222,7 @@ def _build_recent_lo_scoreboard() -> dict[str, Any]:
       age_days = max(0, (generated_at.date() - form_dt.date()).days)
     if age_days > 21:
       continue
-    estimated = _as_int(row.get("estimated_largest_amount"))
+    estimated = _as_int(row.get("estimated_amount")) or _as_int(row.get("estimated_largest_amount"))
     prior_connected_seconds = _as_int(row.get("prior_connected_seconds"))
     prior_call_count = _as_int(row.get("prior_call_count"))
     readiness = _as_int(row.get("readiness_score")) or (85 if prior_connected_seconds >= 90 else 60 if prior_call_count else 42)
@@ -281,10 +281,18 @@ def _build_recent_lo_scoreboard() -> dict[str, Any]:
 
 def _render_recent_lo_scoreboard(payload: dict[str, Any], token: str | None = None) -> str:
   rows = payload["rows"]
+  owners: dict[str, int] = {}
+  for row in rows:
+    owner = str(row.get("owner") or "Unassigned LO Review")
+    owners[owner] = owners.get(owner, 0) + 1
+  owner_tabs = "".join(
+    f"<button type='button' data-owner='{html.escape(owner)}'>{html.escape(owner)} <span>{count}</span></button>"
+    for owner, count in sorted(owners.items())
+  )
   cards: list[str] = []
   for row in rows:
     cards.append(
-      f"""<article class="lead">
+      f"""<article class="lead" data-owner="{html.escape(str(row.get('owner') or 'Unassigned LO Review'))}" data-score="{row['score']}" data-amount="{row['estimated_amount']}" data-age="{row['age_days']}" data-lastcall="{html.escape(str(row.get('days_since_last_call') or '-1'))}">
   <div class="rank">#{row['rank']}</div>
   <div class="mainline"><strong>{html.escape(str(row['first_name']).title())}</strong><span>{html.escape(str(row['estimated_amount_label'] or 'Amount unknown'))}</span></div>
   <div class="meta">{row['age_days']} days old · Last call: {html.escape(str(row.get('days_since_last_call') or 'unknown'))} days ago · Score {row['score']} · {html.escape(str(row['source_category']))}</div>
@@ -306,6 +314,7 @@ def _render_recent_lo_scoreboard(payload: dict[str, Any], token: str | None = No
 .shell{{max-width:1240px;margin:0 auto;padding:26px}}.hero{{display:flex;align-items:flex-end;justify-content:space-between;gap:20px;margin-bottom:16px}}
 h1{{font-size:32px;line-height:1.05;margin:0 0 8px}}p{{line-height:1.42}}.muted,.meta{{color:var(--muted)}}.stats{{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:18px 0}}
 .stat,.lead{{background:var(--card);border:1px solid var(--line);border-radius:8px}}.stat{{padding:15px}}.stat strong{{display:block;font-size:28px}}.stat span{{color:var(--muted)}}
+.toolbar{{display:flex;gap:8px;flex-wrap:wrap;margin:18px 0}}button,select{{border:1px solid var(--line);background:#fff;border-radius:999px;padding:9px 12px;font-weight:700}}button.active{{background:var(--accent);color:#fff;border-color:var(--accent)}}button span{{opacity:.75}}
 .grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:12px}}.lead{{padding:14px;position:relative;min-height:220px}}.rank{{position:absolute;right:14px;top:14px;color:var(--accent);font-weight:800}}
 .mainline{{display:flex;gap:10px;align-items:baseline;padding-right:52px}}.mainline strong{{font-size:20px}}.mainline span{{color:var(--gold);font-weight:800}}.lead p{{margin:13px 0;color:#344054}}
 .chips{{display:flex;gap:6px;flex-wrap:wrap}}.chips span{{font-size:12px;background:#eef4f3;color:#134e48;border-radius:999px;padding:6px 8px}}.links{{display:flex;gap:10px;margin-top:14px}}.links a,.refresh{{color:var(--accent);font-weight:800;text-decoration:none}}
@@ -319,8 +328,35 @@ h1{{font-size:32px;line-height:1.05;margin:0 0 8px}}p{{line-height:1.42}}.muted,
   <div class="stat"><strong>21</strong><span>Day falloff</span></div>
 </section>
 <p class="muted">Generated {generated}</p>
+<section class="toolbar"><button class="active" type="button" data-owner="all">All <span>{len(rows)}</span></button>{owner_tabs}<select id="sort"><option value="score">Sort: Best score</option><option value="amount">Sort: Loan amount</option><option value="fresh">Sort: Freshest lead</option><option value="lastcall">Sort: Oldest last call</option></select></section>
 <section class="grid">{''.join(cards)}</section>
-</div></body></html>"""
+</div><script>
+const buttons=[...document.querySelectorAll('button[data-owner]')];
+const cards=[...document.querySelectorAll('.lead')];
+const grid=document.querySelector('.grid');
+let activeOwner='all';
+function sortCards(){{
+  const mode=document.querySelector('#sort').value;
+  cards.sort((a,b)=>{{
+    if(mode==='amount') return Number(b.dataset.amount||0)-Number(a.dataset.amount||0);
+    if(mode==='fresh') return Number(a.dataset.age||999)-Number(b.dataset.age||999);
+    if(mode==='lastcall') return Number(b.dataset.lastcall||-1)-Number(a.dataset.lastcall||-1);
+    return Number(b.dataset.score||0)-Number(a.dataset.score||0);
+  }}).forEach(card=>grid.appendChild(card));
+}}
+function render(){{
+  cards.forEach(card=>card.style.display=(activeOwner==='all'||card.dataset.owner===activeOwner)?'block':'none');
+  sortCards();
+}}
+buttons.forEach(button=>button.addEventListener('click',()=>{{
+  buttons.forEach(item=>item.classList.remove('active'));
+  button.classList.add('active');
+  activeOwner=button.dataset.owner;
+  render();
+}}));
+document.querySelector('#sort').addEventListener('input', render);
+render();
+</script></body></html>"""
 
 
 async def recent_lo_scoreboard(request: web.Request) -> web.Response:

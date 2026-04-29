@@ -3,11 +3,13 @@ from __future__ import annotations
 import argparse
 import csv
 import hmac
+import html
 import json
 import logging
 import os
 import re
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from urllib import error, request
@@ -39,6 +41,8 @@ CALL_CAPTURE_DIR = EVENT_DIR / "calls"
 GHL_NOTE_DIR = EVENT_DIR / "ghl-notes"
 GHL_NOTE_RETRY_DIR = EVENT_DIR / "ghl-notes-retry"
 REACTIVATION_DIR = DATA_ROOT / "voice-agent" / "reactivation-enrichment"
+SCOREBOARD_DIR = DATA_ROOT / "loan-os" / "scoreboards"
+RECENT_LO_SCOREBOARD_SOURCE = SCOREBOARD_DIR / "recent-lo-source.csv"
 
 
 def _now_ms() -> int:
@@ -86,6 +90,18 @@ def _admin_authorized(request: web.Request) -> bool:
   return hmac.compare_digest(supplied, token)
 
 
+def _scoreboard_authorized(request: web.Request) -> bool:
+  token = os.getenv("SCOREBOARD_ACCESS_TOKEN", "").strip() or os.getenv("RETELL_ADMIN_TOKEN", "").strip()
+  if not token:
+    return False
+  supplied = (
+    request.query.get("token", "")
+    or request.cookies.get("scoreboard_token", "")
+    or request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+  ).strip()
+  return hmac.compare_digest(supplied, token)
+
+
 @web.middleware
 async def operational_guard(request: web.Request, handler):  # noqa: ANN001
   if request.path.startswith("/admin/"):
@@ -112,6 +128,205 @@ def _extract_args(payload: dict[str, Any]) -> dict[str, Any]:
 
 def _digits(value: str | None) -> str:
   return re.sub(r"\D+", "", value or "")
+
+
+def _as_int(value: Any) -> int:
+  try:
+    return int(float(str(value or "0").strip()))
+  except ValueError:
+    return 0
+
+
+def _parse_dt(value: str | None) -> datetime | None:
+  raw = str(value or "").strip()
+  if not raw:
+    return None
+  try:
+    return datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone(UTC)
+  except ValueError:
+    return None
+
+
+def _money(value: Any) -> str:
+  amount = _as_int(value)
+  if amount >= 1_000_000:
+    return f"${amount / 1_000_000:.1f}M"
+  if amount >= 1_000:
+    return f"${amount / 1_000:.0f}K"
+  return f"${amount}" if amount else ""
+
+
+def _read_csv_rows(path: Path) -> list[dict[str, str]]:
+  if not path.exists():
+    return []
+  try:
+    with path.open(newline="", encoding="utf-8", errors="ignore") as handle:
+      return list(csv.DictReader(handle))
+  except OSError:
+    return []
+
+
+def _freshness_points(age_days: int) -> int:
+  if age_days <= 1:
+    return 100
+  if age_days <= 3:
+    return 90
+  if age_days <= 7:
+    return 75
+  if age_days <= 14:
+    return 55
+  if age_days <= 21:
+    return 35
+  return 0
+
+
+def _build_recent_lo_scoreboard() -> dict[str, Any]:
+  enriched_path = RECENT_LO_SCOREBOARD_SOURCE if RECENT_LO_SCOREBOARD_SOURCE.exists() else REACTIVATION_DIR / "launch-batch-2026-04-28-last30.transcript-enriched.csv"
+  enriched = _read_csv_rows(enriched_path)
+  generated_at = datetime.now(UTC)
+  rows: list[dict[str, Any]] = []
+  for row in enriched:
+    form_dt = _parse_dt(row.get("original_form_fill_at"))
+    if not form_dt:
+      continue
+    age_days = max(0, (generated_at.date() - form_dt.date()).days)
+    if age_days > 21:
+      continue
+    estimated = _as_int(row.get("estimated_largest_amount"))
+    prior_connected_seconds = _as_int(row.get("prior_connected_seconds"))
+    prior_call_count = _as_int(row.get("prior_call_count"))
+    readiness = _as_int(row.get("readiness_score")) or (85 if prior_connected_seconds >= 90 else 60 if prior_call_count else 42)
+    profitability = _as_int(row.get("profitability_score")) or (min(100, round(estimated / 12_000)) if estimated else 20)
+    transcript_points = 25 if prior_connected_seconds >= 300 else 15 if prior_connected_seconds >= 90 else 5 if prior_call_count else 0
+    score = _as_int(row.get("score")) or round((_freshness_points(age_days) * 0.48) + (readiness * 0.23) + (profitability * 0.17) + transcript_points)
+    first_name = str(row.get("first_name") or "there").strip()
+    opening = str(row.get("opening_context_line") or "you had reached out about a DSCR loan").strip()
+    rows.append(
+      {
+        "rank": 0,
+        "owner": row.get("owner") or "Unassigned LO Review",
+        "score": score,
+        "age_days": age_days,
+        "estimated_amount": estimated,
+        "estimated_amount_label": _money(estimated),
+        "readiness_score": readiness,
+        "profitability_score": profitability,
+        "first_name": first_name,
+        "phone": row.get("phone", ""),
+        "email": row.get("email", ""),
+        "contact_id": row.get("contact_id", ""),
+        "source_category": row.get("enrichment_source", ""),
+        "prior_call_count": prior_call_count,
+        "prior_connected_seconds": prior_connected_seconds,
+        "opening_context_line": opening,
+        "suggested_opening_line": (
+          f"Hi {first_name}, this is Alex with Evolve Funding. "
+          f"I was just touching base on {opening}. Are you still looking into DSCR loan options or are you all set?"
+        ),
+      }
+    )
+  rows.sort(key=lambda item: (item["score"], item["estimated_amount"], -item["age_days"]), reverse=True)
+  for index, row in enumerate(rows, start=1):
+    row["rank"] = index
+  payload = {
+    "generated_at": generated_at.isoformat(),
+    "source_file": str(enriched_path),
+    "summary": {
+      "row_count": len(rows),
+      "same_week_count": sum(1 for row in rows if row["age_days"] <= 7),
+      "top_25_estimated_amount": sum(_as_int(row["estimated_amount"]) for row in rows[:25]),
+      "auto_falloff_days": 21,
+    },
+    "rows": rows,
+  }
+  SCOREBOARD_DIR.mkdir(parents=True, exist_ok=True)
+  (SCOREBOARD_DIR / "recent-lo-scoreboard.json").write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+  return payload
+
+
+def _render_recent_lo_scoreboard(payload: dict[str, Any], token: str | None = None) -> str:
+  rows = payload["rows"]
+  cards: list[str] = []
+  for row in rows:
+    cards.append(
+      f"""<article class="lead">
+  <div class="rank">#{row['rank']}</div>
+  <div class="mainline"><strong>{html.escape(str(row['first_name']).title())}</strong><span>{html.escape(str(row['estimated_amount_label'] or 'Amount unknown'))}</span></div>
+  <div class="meta">{row['age_days']} days old · Score {row['score']} · {html.escape(str(row['source_category']))}</div>
+  <p>{html.escape(str(row['suggested_opening_line']))}</p>
+  <div class="chips"><span>Recent lead</span><span>{html.escape(str(row['prior_call_count']))} prior calls</span><span>{html.escape(str(row['prior_connected_seconds']))} connected seconds</span></div>
+  <div class="links"><a href="tel:{html.escape(str(row['phone']))}">Call</a><a href="https://app.getmoremortgages.com/v2/location/HSCyuJDGKA5J5gfjfHzi/contacts/detail/{html.escape(str(row['contact_id']))}">GHL</a></div>
+</article>"""
+    )
+  refresh = "/scoreboards/recent-lo"
+  if token:
+    refresh += f"?token={html.escape(token)}"
+  generated = html.escape(str(payload.get("generated_at") or ""))
+  return f"""<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fresh LO Scoreboard</title>
+<style>
+:root{{--ink:#111827;--muted:#667085;--line:#d0d5dd;--bg:#f6f7f9;--card:#fff;--accent:#0f766e;--gold:#a16207}}
+*{{box-sizing:border-box}}body{{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}}
+.shell{{max-width:1240px;margin:0 auto;padding:26px}}.hero{{display:flex;align-items:flex-end;justify-content:space-between;gap:20px;margin-bottom:16px}}
+h1{{font-size:32px;line-height:1.05;margin:0 0 8px}}p{{line-height:1.42}}.muted,.meta{{color:var(--muted)}}.stats{{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:18px 0}}
+.stat,.lead{{background:var(--card);border:1px solid var(--line);border-radius:8px}}.stat{{padding:15px}}.stat strong{{display:block;font-size:28px}}.stat span{{color:var(--muted)}}
+.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:12px}}.lead{{padding:14px;position:relative;min-height:220px}}.rank{{position:absolute;right:14px;top:14px;color:var(--accent);font-weight:800}}
+.mainline{{display:flex;gap:10px;align-items:baseline;padding-right:52px}}.mainline strong{{font-size:20px}}.mainline span{{color:var(--gold);font-weight:800}}.lead p{{margin:13px 0;color:#344054}}
+.chips{{display:flex;gap:6px;flex-wrap:wrap}}.chips span{{font-size:12px;background:#eef4f3;color:#134e48;border-radius:999px;padding:6px 8px}}.links{{display:flex;gap:10px;margin-top:14px}}.links a,.refresh{{color:var(--accent);font-weight:800;text-decoration:none}}
+@media(max-width:760px){{.hero{{display:block}}.stats{{grid-template-columns:1fr 1fr}}.shell{{padding:16px}}}}
+</style></head><body><div class="shell">
+<section class="hero"><div><h1>Fresh LO Scoreboard</h1><p class="muted">Recent leads only. Rows auto-fall off after 21 days. Refreshing this page rebuilds the board from hosted data.</p></div><a class="refresh" href="{refresh}">Refresh</a></section>
+<section class="stats">
+  <div class="stat"><strong>{payload['summary']['row_count']}</strong><span>Fresh leads</span></div>
+  <div class="stat"><strong>{payload['summary']['same_week_count']}</strong><span>0-7 days old</span></div>
+  <div class="stat"><strong>{_money(payload['summary']['top_25_estimated_amount'])}</strong><span>Top 25 est. amount</span></div>
+  <div class="stat"><strong>21</strong><span>Day falloff</span></div>
+</section>
+<p class="muted">Generated {generated}</p>
+<section class="grid">{''.join(cards)}</section>
+</div></body></html>"""
+
+
+async def recent_lo_scoreboard(request: web.Request) -> web.Response:
+  if not _scoreboard_authorized(request):
+    return web.Response(
+      text="Unauthorized. Use the private scoreboard link or ask Dave for access.",
+      status=401,
+      content_type="text/plain",
+    )
+  payload = _build_recent_lo_scoreboard()
+  token = request.query.get("token", "")
+  return web.Response(text=_render_recent_lo_scoreboard(payload, token), content_type="text/html")
+
+
+async def recent_lo_scoreboard_json(request: web.Request) -> web.Response:
+  if not _scoreboard_authorized(request):
+    return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+  return web.json_response(_build_recent_lo_scoreboard())
+
+
+async def admin_recent_lo_scoreboard_import(request: web.Request) -> web.Response:
+  payload = await request.json()
+  rows = payload.get("rows")
+  if not isinstance(rows, list) or not rows:
+    return web.json_response({"ok": False, "error": "rows_required"}, status=400)
+  fieldnames = list(rows[0].keys()) if isinstance(rows[0], dict) else []
+  if not fieldnames:
+    return web.json_response({"ok": False, "error": "dict_rows_required"}, status=400)
+  SCOREBOARD_DIR.mkdir(parents=True, exist_ok=True)
+  with RECENT_LO_SCOREBOARD_SOURCE.open("w", newline="", encoding="utf-8") as handle:
+    writer = csv.DictWriter(handle, fieldnames=fieldnames)
+    writer.writeheader()
+    for row in rows:
+      if isinstance(row, dict):
+        writer.writerow({field: row.get(field, "") for field in fieldnames})
+  payload = _build_recent_lo_scoreboard()
+  _append_event(
+    "recent_lo_scoreboard_imported",
+    {"row_count": len(rows), "source_path": str(RECENT_LO_SCOREBOARD_SOURCE)},
+  )
+  return web.json_response({"ok": True, "imported_rows": len(rows), "published_rows": payload["summary"]["row_count"]})
 
 
 def _lookup_reactivation_lead(phone: str | None) -> dict[str, str]:
@@ -639,7 +854,10 @@ def build_app() -> web.Application:
   app = web.Application(middlewares=[operational_guard])
   app.router.add_get("/health", health)
   app.router.add_get("/ready", ready)
+  app.router.add_get("/scoreboards/recent-lo", recent_lo_scoreboard)
+  app.router.add_get("/scoreboards/recent-lo.json", recent_lo_scoreboard_json)
   app.router.add_get("/admin/status", admin_status)
+  app.router.add_post("/admin/scoreboards/recent-lo/import", admin_recent_lo_scoreboard_import)
   app.router.add_post("/admin/kill", admin_kill)
   app.router.add_post("/admin/resume", admin_resume)
   app.router.add_get("/retell/web-call", web_call_page)

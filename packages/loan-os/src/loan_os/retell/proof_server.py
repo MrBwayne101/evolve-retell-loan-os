@@ -16,6 +16,8 @@ from urllib import error, request
 
 from aiohttp import web
 
+from loan_os.call_center.inbound_callback import prepare_inbound_callback_shadow
+from loan_os.call_center.speed_to_lead import prepare_speed_to_lead_shadow, redact_retell_request
 from loan_os.ghl_calendar import book_selected_slot as book_selected_calendar_slot
 from loan_os.ghl_calendar import format_slot_options, get_availability, select_spread_slots
 
@@ -44,6 +46,11 @@ REACTIVATION_DIR = DATA_ROOT / "voice-agent" / "reactivation-enrichment"
 SCOREBOARD_DIR = DATA_ROOT / "loan-os" / "scoreboards"
 RECENT_LO_SCOREBOARD_SOURCE = SCOREBOARD_DIR / "recent-lo-source.csv"
 SCOREBOARD_ACCESS_TOKEN_FILE = SCOREBOARD_DIR / "access-token"
+SPEED_TO_LEAD_DIR = DATA_ROOT / "loan-os" / "speed-to-lead"
+SPEED_TO_LEAD_QUEUE = SPEED_TO_LEAD_DIR / "shadow-queue.jsonl"
+SPEED_TO_LEAD_AUDIT = SPEED_TO_LEAD_DIR / "shadow-audit.jsonl"
+SPEED_TO_LEAD_LIVE_QUEUE = SPEED_TO_LEAD_DIR / "live-queue.jsonl"
+SPEED_TO_LEAD_LIVE_AUDIT = SPEED_TO_LEAD_DIR / "live-audit.jsonl"
 
 
 def _now_ms() -> int:
@@ -60,6 +67,12 @@ def _append_event(kind: str, payload: dict[str, Any]) -> None:
   with EVENT_LOG.open("a", encoding="utf-8") as f:
     f.write(json.dumps(record, ensure_ascii=False) + "\n")
   LOGGER.info("event", extra={"event_kind": kind})
+
+
+def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
+  path.parent.mkdir(parents=True, exist_ok=True)
+  with path.open("a", encoding="utf-8") as f:
+    f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
 def _setup_logging() -> None:
@@ -81,6 +94,22 @@ def _kill_switch_active() -> bool:
 
 def _side_effects_disabled() -> bool:
   return os.getenv("RETELL_DISABLE_SIDE_EFFECTS", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _speed_to_lead_live_enabled() -> bool:
+  return os.getenv("SPEED_TO_LEAD_LIVE_CALLS_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _speed_to_lead_live_authorized(request: web.Request) -> bool:
+  token = os.getenv("SPEED_TO_LEAD_WEBHOOK_TOKEN", "").strip()
+  if not token:
+    return False
+  supplied = (
+    request.query.get("token", "")
+    or request.headers.get("X-Speed-To-Lead-Token", "")
+    or request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+  ).strip()
+  return hmac.compare_digest(supplied, token)
 
 
 def _admin_authorized(request: web.Request) -> bool:
@@ -129,6 +158,50 @@ def _extract_args(payload: dict[str, Any]) -> dict[str, Any]:
       if isinstance(value, dict):
         return value
   return {}
+
+
+def _load_speed_to_lead_config() -> dict[str, str]:
+  config_path = EVENT_DIR / "speed-to-lead-config.json"
+  config: dict[str, Any] = {}
+  if config_path.exists():
+    try:
+      loaded = json.loads(config_path.read_text(encoding="utf-8"))
+      if isinstance(loaded, dict):
+        config = loaded
+    except (OSError, json.JSONDecodeError):
+      config = {}
+  return {
+    "phone_number": str(
+      os.getenv("RETELL_SPEED_TO_LEAD_FROM_NUMBER")
+      or os.getenv("RETELL_PHONE_NUMBER")
+      or config.get("phone_number")
+      or "+19499983920"
+    ),
+    "agent_id": str(
+      os.getenv("RETELL_SPEED_TO_LEAD_AGENT_ID")
+      or config.get("agent_id")
+      or "agent_0e471ea4134a550d1e77d777fd"
+    ),
+  }
+
+
+def _retell_api(path: str, *, method: str = "GET", body: dict[str, Any] | None = None) -> dict[str, Any]:
+  api_key = os.getenv("RETELL_API_KEY", "").strip()
+  if not api_key:
+    raise RuntimeError("RETELL_API_KEY is not configured")
+  data = None if body is None else json.dumps(body).encode("utf-8")
+  req = request.Request(
+    f"https://api.retellai.com{path}",
+    data=data,
+    method=method,
+    headers={
+      "Authorization": f"Bearer {api_key}",
+      "Content-Type": "application/json",
+    },
+  )
+  with request.urlopen(req, timeout=60) as resp:
+    raw = resp.read().decode("utf-8")
+    return json.loads(raw) if raw else {"ok": True}
 
 
 def _digits(value: str | None) -> str:
@@ -448,6 +521,41 @@ def _lookup_reactivation_lead(phone: str | None) -> dict[str, str]:
   return {}
 
 
+def _inbound_callback_context_from_lead(lead: dict[str, str]) -> dict[str, Any]:
+  if not lead:
+    return {}
+  return {
+    "contact": {
+      "id": lead.get("contact_id", ""),
+      "first_name": lead.get("first_name", ""),
+      "last_name": lead.get("last_name", ""),
+      "phone": lead.get("phone", ""),
+      "email": lead.get("email", ""),
+      "tags": lead.get("tags", ""),
+    },
+    "scenario": {
+      "loan_goal": lead.get("loan_goal") or lead.get("transaction_type") or lead.get("loan_purpose") or "",
+      "property_state": lead.get("property_state") or lead.get("state") or "",
+      "property_type": lead.get("property_type") or "",
+      "purchase_price": lead.get("purchase_price") or lead.get("estimated_largest_amount") or "",
+      "estimated_value": lead.get("estimated_value") or "",
+      "current_balance": lead.get("current_balance") or "",
+      "credit_score": lead.get("credit_score") or "",
+      "down_payment_available": lead.get("down_payment_available") or "",
+    },
+    "recent_outbound": {
+      "call_id": lead.get("prior_retell_call_id") or lead.get("call_id") or "",
+      "outcome": lead.get("prior_retell_outcome") or "",
+      "opening_context_line": lead.get("opening_context_line") or lead.get("reactivation_brief") or "",
+      "agent_name": "Alex",
+      "appointment_fallback_requested": lead.get("appointment_fallback_requested") == "true",
+    },
+    "opening_context_line": lead.get("opening_context_line") or lead.get("reactivation_brief") or "",
+    "loan_status": lead.get("loan_status") or lead.get("pipeline_status") or "",
+    "dnc": (lead.get("dnc") or lead.get("phone_dnd") or "").lower() in {"1", "true", "yes"},
+  }
+
+
 async def health(_: web.Request) -> web.Response:
   return web.json_response({"ok": True, "service": "loan-os-retell-proof"})
 
@@ -477,7 +585,145 @@ async def ready(_: web.Request) -> web.Response:
   checks["ghl_configured"] = {"ok": _ghl_configured()}
   checks["kill_switch"] = {"active": _kill_switch_active()}
   checks["side_effects"] = {"disabled": _side_effects_disabled()}
+  checks["speed_to_lead_shadow"] = {
+    "ok": True,
+    "queue_path": str(SPEED_TO_LEAD_QUEUE),
+    "audit_path": str(SPEED_TO_LEAD_AUDIT),
+    "live_queue_path": str(SPEED_TO_LEAD_LIVE_QUEUE),
+    "live_calls_enabled": _speed_to_lead_live_enabled(),
+    "live_webhook_token_configured": bool(os.getenv("SPEED_TO_LEAD_WEBHOOK_TOKEN", "").strip()),
+  }
   return web.json_response({"ok": status == 200, "checks": checks}, status=status)
+
+
+async def speed_to_lead_shadow_intake(request: web.Request) -> web.Response:
+  _load_env()
+  try:
+    payload = await request.json()
+  except Exception:
+    return web.json_response({"ok": False, "error": "invalid_json"}, status=400)
+
+  config = {
+    "phone_number": os.getenv("RETELL_SPEED_TO_LEAD_FROM_NUMBER", os.getenv("RETELL_PHONE_NUMBER", "+19495691592")),
+    "agent_id": os.getenv("RETELL_SPEED_TO_LEAD_AGENT_ID", "agent_bafe1e2eede30a82315734615f"),
+  }
+  source_system = str(request.query.get("source_system") or payload.get("event_source") or "custom_website_api")
+  result = prepare_speed_to_lead_shadow(payload, config, source_system=source_system)
+  _append_jsonl(SPEED_TO_LEAD_QUEUE, result.shadow_queue_row)
+  _append_jsonl(SPEED_TO_LEAD_AUDIT, result.audit_event.to_record())
+  response = {
+    "ok": True,
+    "live_call_launched": False,
+    "ghl_write_attempted": False,
+    "los_write_attempted": False,
+    "borrower_message_sent": False,
+    "compliance": result.compliance.to_record(),
+    "queue_row": result.shadow_queue_row,
+    "call_context": result.call_context,
+    "retell_request_redacted": redact_retell_request(result.retell_request),
+  }
+  _append_event("speed_to_lead_shadow_intake", response)
+  return web.json_response(response)
+
+
+async def speed_to_lead_live_intake(request: web.Request) -> web.Response:
+  _load_env()
+  try:
+    payload = await request.json()
+  except Exception:
+    return web.json_response({"ok": False, "error": "invalid_json"}, status=400)
+
+  config = _load_speed_to_lead_config()
+  source_system = str(request.query.get("source_system") or payload.get("event_source") or "ghl_webhook")
+  result = prepare_speed_to_lead_shadow(payload, config, source_system=source_system)
+  queue_record = {
+    **result.shadow_queue_row,
+    "queue_name": "speed-to-lead-live-queue",
+    "write_mode": "live_call_only_no_crm_or_los_writes",
+    "live_call_enabled": _speed_to_lead_live_enabled(),
+    "side_effects_disabled": _side_effects_disabled(),
+  }
+  _append_jsonl(SPEED_TO_LEAD_LIVE_QUEUE, queue_record)
+  _append_jsonl(SPEED_TO_LEAD_LIVE_AUDIT, result.audit_event.to_record())
+
+  if not _speed_to_lead_live_authorized(request):
+    response = {
+      "ok": False,
+      "live_call_launched": False,
+      "error": "unauthorized_live_intake",
+      "compliance": result.compliance.to_record(),
+      "queue_row": queue_record,
+    }
+    _append_event("speed_to_lead_live_intake_blocked", response)
+    return web.json_response(response, status=401)
+  if not _speed_to_lead_live_enabled():
+    response = {
+      "ok": False,
+      "live_call_launched": False,
+      "error": "speed_to_lead_live_calls_disabled",
+      "compliance": result.compliance.to_record(),
+      "queue_row": queue_record,
+    }
+    _append_event("speed_to_lead_live_intake_disabled", response)
+    return web.json_response(response, status=409)
+  if _side_effects_disabled():
+    response = {
+      "ok": False,
+      "live_call_launched": False,
+      "error": "retell_side_effects_disabled",
+      "compliance": result.compliance.to_record(),
+      "queue_row": queue_record,
+    }
+    _append_event("speed_to_lead_live_intake_side_effects_disabled", response)
+    return web.json_response(response, status=409)
+  if not result.compliance.eligible:
+    response = {
+      "ok": True,
+      "live_call_launched": False,
+      "held_for": result.compliance.reasons,
+      "next_allowed_call_at": result.compliance.allowed_at,
+      "compliance": result.compliance.to_record(),
+      "queue_row": queue_record,
+    }
+    _append_event("speed_to_lead_live_intake_held", response)
+    return web.json_response(response)
+  if not result.retell_request.get("to_number") or not result.retell_request.get("from_number") or not result.retell_request.get("override_agent_id"):
+    response = {
+      "ok": False,
+      "live_call_launched": False,
+      "error": "missing_retell_call_fields",
+      "retell_request_redacted": redact_retell_request(result.retell_request),
+      "compliance": result.compliance.to_record(),
+      "queue_row": queue_record,
+    }
+    _append_event("speed_to_lead_live_intake_invalid_retell_request", response)
+    return web.json_response(response, status=422)
+
+  retell_payload = dict(result.retell_request)
+  metadata = dict(retell_payload.get("metadata") or {})
+  metadata.update(
+    {
+      "purpose": "speed_to_lead_live_new_lead",
+      "launch_live_calls": "true",
+      "shadow_mode": "false",
+      "ghl_write_enabled": "false",
+      "los_write_enabled": "false",
+      "borrower_messaging_enabled": "false",
+    }
+  )
+  retell_payload["metadata"] = metadata
+  started = _retell_api("/v2/create-phone-call", method="POST", body=retell_payload)
+  response = {
+    "ok": True,
+    "live_call_launched": True,
+    "retell_call_id": started.get("call_id"),
+    "retell_status": started.get("call_status"),
+    "compliance": result.compliance.to_record(),
+    "queue_row": queue_record,
+    "retell_request_redacted": redact_retell_request(retell_payload),
+  }
+  _append_event("speed_to_lead_live_call_started", response)
+  return web.json_response(response)
 
 
 async def admin_status(_: web.Request) -> web.Response:
@@ -519,6 +765,16 @@ async def inbound_callback_webhook(request: web.Request) -> web.Response:
   inbound = payload.get("call_inbound") if isinstance(payload.get("call_inbound"), dict) else {}
   from_number = str(inbound.get("from_number") or payload.get("from_number") or "")
   lead = _lookup_reactivation_lead(from_number)
+  shadow = prepare_inbound_callback_shadow(
+    {
+      "call_id": inbound.get("call_id") or payload.get("call_id") or "",
+      "from_number": from_number,
+      "to_number": inbound.get("to_number") or payload.get("to_number") or "",
+      "timestamp": datetime.now(UTC).isoformat(),
+      "source": "retell_inbound_callback_webhook",
+    },
+    _inbound_callback_context_from_lead(lead),
+  )
   dynamic_variables = {
     "first_name": lead.get("first_name", ""),
     "ghl_contact_id": lead.get("contact_id", ""),
@@ -527,6 +783,10 @@ async def inbound_callback_webhook(request: web.Request) -> web.Response:
     "reactivation_brief": lead.get("reactivation_brief", ""),
     "recommended_first_question": lead.get("recommended_first_question", ""),
     "callback_context_found": "true" if lead else "false",
+    "callback_opener": shadow.opener,
+    "callback_next_best_question": shadow.next_best_question,
+    "callback_review_gate": shadow.review_gate.get("status", ""),
+    "callback_recommendation": shadow.transfer_book_recommendation.get("action", ""),
   }
   response = {
     "call_inbound": {
@@ -541,6 +801,43 @@ async def inbound_callback_webhook(request: web.Request) -> web.Response:
     }
   }
   _append_event("retell_inbound_callback_webhook", {"payload": payload, "response": response})
+  return web.json_response(response)
+
+
+async def inbound_callback_context(request: web.Request) -> web.Response:
+  phone = str(request.query.get("phone") or "")
+  if not phone and request.can_read_body:
+    try:
+      payload = await request.json()
+    except Exception:
+      payload = {}
+    if isinstance(payload, dict):
+      phone = str(payload.get("phone") or payload.get("from_number") or payload.get("caller_phone") or "")
+  lead = _lookup_reactivation_lead(phone)
+  result = prepare_inbound_callback_shadow(
+    {
+      "from_number": phone,
+      "to_number": str(request.query.get("to_number") or ""),
+      "timestamp": datetime.now(UTC).isoformat(),
+      "source": "hosted_context_lookup",
+    },
+    _inbound_callback_context_from_lead(lead),
+  )
+  response = {
+    "ok": True,
+    "context_found": bool(lead),
+    "external_writes": False,
+    "shadow": result.to_record(),
+  }
+  _append_event(
+    "retell_inbound_callback_context_lookup",
+    {
+      "phone_redacted": result.callback_event.get("caller_phone_redacted"),
+      "context_found": bool(lead),
+      "review_gate": result.review_gate.get("status"),
+      "recommendation": result.transfer_book_recommendation.get("action"),
+    },
+  )
   return web.json_response(response)
 
 
@@ -875,7 +1172,11 @@ async def book_or_transfer(request: web.Request) -> web.Response:
   args = _extract_args(payload)
   _append_event("retell_tool_book_or_transfer", {"payload": payload, "args": args})
 
-  consent = bool(args.get("caller_confirmed_transfer_or_booking") or args.get("consent"))
+  operating_mode = str(args.get("speed_to_lead_operating_mode") or args.get("operating_mode") or "")
+  appointment_only_policy = bool(args.get("appointment_only") or args.get("appointment_only_policy")) or operating_mode.startswith(
+    "weekday_after_5_appointment_only"
+  )
+  consent = bool(args.get("caller_confirmed_transfer_or_booking") or args.get("consent") or appointment_only_policy)
   if not consent:
     return web.json_response(
       {
@@ -911,7 +1212,7 @@ async def book_or_transfer(request: web.Request) -> web.Response:
     "calendar_id": availability.get("calendar_id"),
     "availability_mode": availability.get("mode"),
     "available_slots": slots,
-    "message": f"The loan officer didn't pick up, but I can grab a time. I have {slot_message}. Which works best?",
+    "message": f"The loan officer didn't pick up, but I can grab a time. I have {slot_message}. Which of those works best?",
   }
   _append_event("retell_tool_availability_returned", result)
   return web.json_response(result)
@@ -940,6 +1241,8 @@ def build_app() -> web.Application:
   app = web.Application(middlewares=[operational_guard])
   app.router.add_get("/health", health)
   app.router.add_get("/ready", ready)
+  app.router.add_post("/speed-to-lead/shadow-intake", speed_to_lead_shadow_intake)
+  app.router.add_post("/speed-to-lead/live-intake", speed_to_lead_live_intake)
   app.router.add_get("/scoreboards/recent-lo", recent_lo_scoreboard)
   app.router.add_get("/scoreboards/recent-lo.json", recent_lo_scoreboard_json)
   app.router.add_get("/admin/status", admin_status)
@@ -952,6 +1255,8 @@ def build_app() -> web.Application:
   app.router.add_post("/retell/create-web-call", create_web_call)
   app.router.add_post("/retell/webhook", retell_webhook)
   app.router.add_post("/retell/inbound-callback-webhook", inbound_callback_webhook)
+  app.router.add_get("/retell/inbound-callback-context", inbound_callback_context)
+  app.router.add_post("/retell/inbound-callback-context", inbound_callback_context)
   app.router.add_post("/retell/tools/book_or_transfer", book_or_transfer)
   app.router.add_post("/retell/tools/book_selected_slot", book_selected_slot)
   app.router.add_post("/retell/tools/log_call_note", log_call_note)

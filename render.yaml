@@ -24,5 +24,11 @@ services:
         value: "true"
       - key: RETELL_PROOF_ALLOW_LIVE_GHL_BOOKING
         value: "false"
+      - key: SPEED_TO_LEAD_LIVE_CALLS_ENABLED
+        value: "true"
+      - key: RETELL_SPEED_TO_LEAD_FROM_NUMBER
+        value: "+19499983920"
+      - key: RETELL_SPEED_TO_LEAD_AGENT_ID
+        value: "agent_0e471ea4134a550d1e77d777fd"
       - key: LOG_LEVEL
         value: INFO

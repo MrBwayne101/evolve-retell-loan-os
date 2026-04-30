@@ -171,6 +171,96 @@ def _mock_slots(timezone_name: str, calendar_id: str) -> list[dict[str, Any]]:
   return slots[:3]
 
 
+def _slot_start(slot: dict[str, Any]) -> datetime | None:
+  return _parse_dt(slot.get("start_iso") or slot.get("startTime") or slot.get("start"))
+
+
+def _dedupe_slot_sequence(slots: list[dict[str, Any]]) -> list[dict[str, Any]]:
+  unique: dict[str, dict[str, Any]] = {}
+  for slot in sorted(slots, key=lambda item: str(item.get("start_iso") or "")):
+    key = str(slot.get("start_iso") or slot.get("display") or len(unique))
+    unique.setdefault(key, slot)
+  return list(unique.values())
+
+
+def select_spread_slots(slots: list[dict[str, Any]], *, limit: int = 3) -> list[dict[str, Any]]:
+  """Choose borrower-facing calendar options that are not stacked back-to-back.
+
+  GHL often returns adjacent openings first, like 7:30, 8:00, 9:00. For sales calls,
+  that is a poor offer set. This chooses the earliest reasonable slot, then spreads
+  the remaining options across the next business window when inventory allows.
+  """
+  if limit <= 0:
+    return []
+  clean = [slot for slot in slots if isinstance(slot, dict)]
+  if len(clean) <= limit:
+    return clean[:limit]
+
+  ordered = _dedupe_slot_sequence(clean)
+  ordered.sort(key=lambda slot: (_slot_start(slot) or datetime.max.replace(tzinfo=UTC), str(slot.get("display") or "")))
+  if len(ordered) <= limit:
+    return ordered[:limit]
+
+  first_start = _slot_start(ordered[0])
+  if first_start is None:
+    midpoint = len(ordered) // 2
+    return [ordered[0], ordered[midpoint], ordered[-1]][:limit]
+
+  # "Next 12 business hours" usually spans today plus the next morning. Cap the
+  # candidate set to roughly two calendar days so we do not offer far-out slots.
+  candidate_window_end = first_start + timedelta(hours=36)
+  candidates = [slot for slot in ordered if (_slot_start(slot) or first_start) <= candidate_window_end]
+  if len(candidates) < limit:
+    candidates = ordered
+
+  targets = [first_start, first_start + timedelta(hours=4), first_start + timedelta(hours=24)]
+  selected: list[dict[str, Any]] = []
+
+  def far_enough(candidate: dict[str, Any], *, minimum_hours: float) -> bool:
+    candidate_start = _slot_start(candidate)
+    if candidate_start is None:
+      return True
+    for existing in selected:
+      existing_start = _slot_start(existing)
+      if existing_start is not None and abs((candidate_start - existing_start).total_seconds()) < minimum_hours * 3600:
+        return False
+    return True
+
+  for target in targets:
+    remaining = [slot for slot in candidates if slot not in selected]
+    if not remaining:
+      break
+    spaced = [slot for slot in remaining if far_enough(slot, minimum_hours=2.5)]
+    pool = spaced or remaining
+    choice = min(
+      pool,
+      key=lambda slot: abs(((_slot_start(slot) or target) - target).total_seconds()),
+    )
+    selected.append(choice)
+    if len(selected) >= limit:
+      break
+
+  for slot in candidates:
+    if len(selected) >= limit:
+      break
+    if slot not in selected:
+      selected.append(slot)
+
+  selected.sort(key=lambda slot: (_slot_start(slot) or datetime.max.replace(tzinfo=UTC), str(slot.get("display") or "")))
+  return selected[:limit]
+
+
+def format_slot_options(slots: list[dict[str, Any]]) -> str:
+  displays = [str(slot.get("display") or "").strip() for slot in slots if str(slot.get("display") or "").strip()]
+  if not displays:
+    return ""
+  if len(displays) == 1:
+    return displays[0]
+  if len(displays) == 2:
+    return f"{displays[0]} or {displays[1]}"
+  return f"{displays[0]}, {displays[1]}, or {displays[2]}"
+
+
 async def get_availability(*, timezone_name: str | None = None, limit: int = 3) -> dict[str, Any]:
   config = _config()
   tz_name = timezone_name or config.timezone

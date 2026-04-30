@@ -17,7 +17,7 @@ from urllib import error, request
 from aiohttp import web
 
 from loan_os.ghl_calendar import book_selected_slot as book_selected_calendar_slot
-from loan_os.ghl_calendar import get_availability
+from loan_os.ghl_calendar import format_slot_options, get_availability, select_spread_slots
 
 
 LOGGER = logging.getLogger("loan_os.retell.proof_server")
@@ -886,9 +886,9 @@ async def book_or_transfer(request: web.Request) -> web.Response:
 
   availability = await get_availability(
     timezone_name=str(args.get("timezone") or "America/Los_Angeles"),
-    limit=3,
+    limit=24,
   )
-  slots = availability.get("slots", [])
+  slots = select_spread_slots(availability.get("slots", []), limit=3)
   if not availability.get("ok") or not slots:
     return web.json_response(
       {
@@ -901,13 +901,7 @@ async def book_or_transfer(request: web.Request) -> web.Response:
       }
     )
 
-  displays = [str(slot.get("display")) for slot in slots[:3]]
-  if len(displays) == 1:
-    slot_message = displays[0]
-  elif len(displays) == 2:
-    slot_message = f"{displays[0]} or {displays[1]}"
-  else:
-    slot_message = f"{displays[0]}, {displays[1]}, or {displays[2]}"
+  slot_message = format_slot_options(slots)
 
   result = {
     "ok": True,
@@ -916,8 +910,8 @@ async def book_or_transfer(request: web.Request) -> web.Response:
     "needs_slot_selection": True,
     "calendar_id": availability.get("calendar_id"),
     "availability_mode": availability.get("mode"),
-    "available_slots": slots[:3],
-    "message": f"Looks like I couldn't get someone live. Let me pull up availability and get an appointment booked for you. I have {slot_message}. Which of those works best?",
+    "available_slots": slots,
+    "message": f"The loan officer didn't pick up, but I can grab a time. I have {slot_message}. Which works best?",
   }
   _append_event("retell_tool_availability_returned", result)
   return web.json_response(result)
